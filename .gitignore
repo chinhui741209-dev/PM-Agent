@@ -1,0 +1,31 @@
+# ===== 祕密 / 環境設定（絕不上傳）=====
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# ===== 資料與 log（含產生紀錄，可能有需求內容）=====
+data/
+**/data/
+*.log
+
+# ===== Python =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# ===== Node / 前端 =====
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+*.local
+
+# ===== 系統 / 編輯器 =====
+.DS_Store
+.idea/
+.vscode/
