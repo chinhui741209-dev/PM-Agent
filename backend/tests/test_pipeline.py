@@ -2,8 +2,12 @@
 import io
 
 from app.services import parser
+import datetime
+
 from app.services.wbs_generator import (
+    _apply_schedule,
     _build_tree,
+    _detect_unit_days,
     _extract_json,
     _normalize_tool_input,
     _parse_date,
@@ -76,7 +80,34 @@ def test_normalize_any_nodelike_value():
 
 
 def test_normalize_garbage_returns_empty():
-    assert _normalize_tool_input("not json") == {}
+    assert _normalize_tool_input("not json") == {"nodes": [], "milestones": []}
+
+
+def test_normalize_name_alias_and_nested_children():
+    # 大模型常見：WBS 鍵 + name(非 title) + children 巢狀 + end_date(非 due_date)
+    obj = {
+        "WBS": [
+            {"id": "1", "name": "需求分析", "start_date": "2026-06-01", "end_date": "2026-07-31",
+             "children": [{"id": "1.1", "name": "蒐集需求", "owner": "PM"}]}
+        ]
+    }
+    out = _normalize_tool_input(obj)
+    assert len(out["nodes"]) == 2
+    root = next(n for n in out["nodes"] if n["id"] == "1")
+    child = next(n for n in out["nodes"] if n["id"] == "1.1")
+    assert root["title"] == "需求分析"          # name → title
+    assert root["due_date"] == "2026-07-31"     # end_date → due_date
+    assert root["type"] == "epic"               # 深度 0 推為 epic
+    assert child["parent_id"] == "1"            # children 攤平出 parent_id
+    assert child["type"] == "story"             # 深度 1 推為 story
+    assert child["owner_unit"] == "PM"          # owner → owner_unit
+
+
+def test_build_tree_from_nested_name_schema():
+    obj = {"WBS": [{"id": "1", "name": "A", "children": [{"id": "1.1", "name": "B"}]}]}
+    tree = _build_tree(_normalize_tool_input(obj)["nodes"])
+    assert len(tree) == 1 and tree[0].title == "A"
+    assert tree[0].children[0].title == "B"
 
 
 # ---- parse_wbs_content（端到端字串 → dict）----
@@ -146,6 +177,36 @@ def test_build_tree_orphan_becomes_root():
 
 
 # ---- _parse_date ----
+
+def test_detect_unit_days():
+    assert _detect_unit_days("以週為單位規劃") == 7
+    assert _detect_unit_days("用 sprint 雙週") == 14
+    assert _detect_unit_days("排到日") == 1
+    assert _detect_unit_days("以月規劃") == 30
+    assert _detect_unit_days("無特別要求") is None
+
+
+def test_apply_schedule_weekly_fills_dates():
+    # 模型只給 due_date、缺 start_date 的情境
+    flat = [
+        {"id": "e1", "parent_id": None, "type": "epic", "title": "E"},
+        {"id": "t1", "parent_id": "e1", "type": "task", "title": "A"},
+        {"id": "t2", "parent_id": "e1", "type": "task", "title": "B"},
+    ]
+    tree = _build_tree(flat)
+    today = datetime.date(2026, 6, 1)  # 週一
+    _apply_schedule(tree, today, datetime.date(2027, 3, 1), unit_days=7)
+    leaves = [c for c in tree[0].children]
+    # 每個葉節點都有起訖日與估時
+    assert all(l.start_date and l.due_date and l.estimate_days == 5 for l in leaves)
+    # 連續的週：第二個葉節點比第一個晚 7 天開始
+    assert (leaves[1].start_date - leaves[0].start_date).days == 7
+    # 葉節點工期為一週內（週一→週五 = 4 天差）
+    assert (leaves[0].due_date - leaves[0].start_date).days == 4
+    # 父節點起訖日由子節點上捲
+    assert tree[0].start_date == leaves[0].start_date
+    assert tree[0].due_date == leaves[-1].due_date
+
 
 def test_parse_date_variants():
     assert _parse_date("2026-09-30").isoformat() == "2026-09-30"

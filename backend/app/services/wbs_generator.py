@@ -10,12 +10,13 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from datetime import date
+from datetime import date, timedelta
 
 from openai import OpenAI
 
 from ..config import get_settings
 from . import gen_log
+from .zh_convert import to_tw
 
 logger = logging.getLogger("ai_agent_pm.wbs")
 from ..models import (
@@ -89,11 +90,72 @@ def _extract_json(text: str) -> str | None:
     return None
 
 
+# 各欄位的可接受別名（模型常用不同名稱；大模型對長文件尤其愛改 schema）
+_ALIASES = {
+    "id": ["id", "ID", "wbs_id", "code", "no"],
+    "parent_id": ["parent_id", "parent", "parentId", "parent_code"],
+    "title": ["title", "name", "summary", "label", "task", "task_name", "名稱", "名称", "標題", "标题", "工作項目", "工作项目"],
+    "description": ["description", "desc", "detail", "details", "說明", "描述", "备注", "備註"],
+    "type": ["type", "level", "node_type", "類型", "类型"],
+    "owner_unit": ["owner_unit", "owner", "unit", "department", "responsible", "負責單位", "负责单位", "責任單位", "责任单位"],
+    "start_date": ["start_date", "start", "begin", "begin_date", "start_dt", "開始", "开始", "起始日"],
+    "due_date": ["due_date", "end_date", "end", "finish", "finish_date", "deadline", "due", "結束", "结束", "到期", "截止"],
+    "estimate_days": ["estimate_days", "estimate", "duration_days", "duration", "工時", "工时", "工期"],
+    "milestone_id": ["milestone_id", "milestone"],
+    "workflow_stage": ["workflow_stage", "stage", "status", "phase", "狀態", "状态", "階段", "阶段"],
+    "dependencies": ["dependencies", "deps", "depends_on", "predecessors", "依賴", "依赖", "前置"],
+    "deliverable": ["deliverable", "deliverables", "output", "產出", "产出", "交付物"],
+}
+_CHILD_KEYS = ["children", "subtasks", "sub_tasks", "subs", "tasks", "items", "子項", "子项", "子任務", "子任务"]
+
+
+def _pick(d: dict, field: str):
+    for k in _ALIASES.get(field, [field]):
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
+
+
+def _schedule_directive(conditions: str, today: str, delivery: str) -> str:
+    """依『相關條件』偵測排程粒度（週/雙週/日/月），產生明確的排程硬指令。
+    本地模型對埋在條件裡的要求常忽略，故抽出來放成獨立、具體的規則。"""
+    c = conditions or ""
+    base = (
+        "每一個工作項都必須同時填寫 start_date 與 due_date（不可只填其一、不可留空），"
+        f"且都落在 {today} 與交付日（{delivery}）之間；依相依順序前後串接，葉節點（task/subtask）要有 estimate_days。"
+    )
+    has = lambda *ks: any(k in c for k in ks)  # noqa: E731
+    if has("雙週", "双周", "兩週", "两周", "二週", "sprint", "Sprint", "2週", "2周"):
+        return base + " 以『雙週(2 週)』為規劃單位：每個葉節點工期約 10 個工作天（estimate_days≈10），日期以兩週為粒度切分，不要用整月粒度。"
+    if has("週", "周", "week", "Week", "WEEK", "每周", "每週"):
+        return (
+            base + " 以『週』為規劃單位：每個葉節點工期約 1 週（estimate_days≈5），"
+            "start_date 與 due_date 以週為粒度切分（例如週一開始、同週或隔週週五結束），"
+            "整份 WBS 的時間軸是一連串連續的『週』，不要把到期日全部壓在月底。"
+        )
+    if has("日", "天", "每日", "day", "Day", "daily"):
+        return base + " 以『日』為規劃單位：estimate_days 以天計，日期精確到日。"
+    if has("月", "每月", "month", "Month"):
+        return base + " 以『月』為規劃單位：每個葉節點工期約 1 個月。"
+    return base
+
+
+def _as_str(v):
+    """把欄位值正規化成字串（模型偶爾給 list/數字）。None→None。"""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        s = "、".join(str(x) for x in v if x not in (None, ""))
+        return s or None
+    return str(v)
+
+
 def _looks_like_nodes(v) -> bool:
-    """判斷一個值是不是「節點清單」：list 裡多是含 title/type/id 的 dict。"""
+    """判斷一個值是不是「節點清單」：list 裡多數元素含 id/title/name/type 任一鍵。"""
     if not isinstance(v, list) or not v:
         return False
-    hits = sum(1 for x in v if isinstance(x, dict) and ({"title", "type", "id"} & set(x.keys())))
+    keys = {"title", "name", "type", "id", "task", "summary"}
+    hits = sum(1 for x in v if isinstance(x, dict) and (keys & set(x.keys())))
     return hits >= max(1, len(v) // 2)
 
 
@@ -106,48 +168,115 @@ def _coerce_list(v):
     return v if isinstance(v, list) else []
 
 
+def _flatten_nodes(raw_nodes: list, parent_id=None, depth: int = 0, out=None, counter=None) -> list:
+    """把任意 WBS 表示法攤平成扁平節點清單（統一欄位名 + parent_id）。
+    同時支援：① 扁平 + parent_id ② 巢狀 children。並把 name→title、end_date→due_date 等別名統一。"""
+    if out is None:
+        out = []
+    if counter is None:
+        counter = {"n": 0}
+    depth_type = ["epic", "story", "task", "subtask", "subtask"]
+    for n in raw_nodes:
+        if not isinstance(n, dict):
+            continue
+        # 以 0 起算的出現序作為備援 id：有些模型用整數 index 當 parent_id
+        idx = counter["n"]
+        counter["n"] += 1
+        nid = _pick(n, "id")
+        nid = str(nid) if nid not in (None, "") else str(idx)
+        ntype = _pick(n, "type")
+        if ntype not in ("epic", "story", "task", "subtask"):
+            ntype = depth_type[min(depth, len(depth_type) - 1)]
+        # parent_id：巢狀時用結構上的父；扁平時讀自身的 parent 欄位
+        pid = parent_id if parent_id is not None else _pick(n, "parent_id")
+        deps = _pick(n, "dependencies")
+        out.append(
+            {
+                "id": nid,
+                "parent_id": str(pid) if pid not in (None, "") else None,
+                "type": ntype,
+                "title": _as_str(_pick(n, "title")) or "",
+                "description": _as_str(_pick(n, "description")) or "",
+                "deliverable": _as_str(_pick(n, "deliverable")),
+                "owner_unit": _as_str(_pick(n, "owner_unit")),
+                "estimate_days": _pick(n, "estimate_days"),
+                "start_date": _as_str(_pick(n, "start_date")),
+                "due_date": _as_str(_pick(n, "due_date")),
+                "milestone_id": _as_str(_pick(n, "milestone_id")),
+                "workflow_stage": _as_str(_pick(n, "workflow_stage")),
+                "dependencies": [str(d) for d in deps] if isinstance(deps, list) else [],
+            }
+        )
+        # 遞迴攤平巢狀子節點
+        for ck in _CHILD_KEYS:
+            kids = n.get(ck)
+            if isinstance(kids, list) and kids and all(isinstance(k, dict) for k in kids):
+                _flatten_nodes(kids, parent_id=nid, depth=depth + 1, out=out, counter=counter)
+                break
+    return out
+
+
+def _find_node_list(obj: dict) -> list:
+    """從 dict 中找出節點清單：先試常見鍵（不分大小寫），再退而求任何 node-like 的值。"""
+    # 包裝層：值可能本身就是清單，或內含 nodes
+    candidates = ["nodes", "wbs", "tasks", "work_items", "items", "wbs_nodes",
+                  "work_breakdown", "result", "data", "parameters", "arguments", "input"]
+    lower = {k.lower(): k for k in obj.keys()}
+    for c in candidates:
+        if c in lower:
+            v = obj[lower[c]]
+            if isinstance(v, dict):  # 再往內一層找
+                inner = _find_node_list(v)
+                if inner:
+                    return inner
+            lst = _coerce_list(v)
+            if _looks_like_nodes(lst):
+                return lst
+    # 退路：任何看起來像節點清單的值
+    for v in obj.values():
+        lst = _coerce_list(v)
+        if _looks_like_nodes(lst):
+            return lst
+    return []
+
+
 def _normalize_tool_input(obj):
-    """把本地模型常見的雜格式正規化成 {nodes:[...], milestones:[...]}。
-    處理：直接回陣列、外層多包 parameters/wbs、節點放在別的 key、字串化的清單。"""
+    """把模型各種雜格式正規化成 {nodes:[扁平、統一欄位], milestones:[...]}。
+    處理：裸陣列、外層包裝、別名鍵、字串化清單、name/title 別名、巢狀 children 攤平。"""
     if isinstance(obj, str):
         try:
             obj = json.loads(obj)
         except json.JSONDecodeError:
-            return {}
-    # 模型直接回一個陣列 → 當成 nodes
+            return {"nodes": [], "milestones": []}
     if isinstance(obj, list):
-        return {"nodes": obj if _looks_like_nodes(obj) else [], "milestones": []}
+        raw_nodes = obj if _looks_like_nodes(obj) else []
+        return {"nodes": _flatten_nodes(raw_nodes), "milestones": []}
     if not isinstance(obj, dict):
-        return {}
+        return {"nodes": [], "milestones": []}
 
-    # 解開常見包裝層（值可能是 dict 或字串化 dict）
-    if "nodes" not in obj:
-        for wrapper in ("parameters", "arguments", "input", "wbs", "result", "data"):
-            inner = obj.get(wrapper)
-            if isinstance(inner, str):
-                try:
-                    inner = json.loads(inner)
-                except json.JSONDecodeError:
-                    inner = None
-            if isinstance(inner, dict) and "nodes" in inner:
-                obj = inner
-                break
+    raw_nodes = _find_node_list(obj)
+    flat = _flatten_nodes(raw_nodes)
 
-    # 還是沒有 nodes → 找其他常見鍵名，或任何「看起來像節點清單」的值
-    if not _coerce_list(obj.get("nodes")):
-        for alt in ("nodes", "tasks", "work_items", "items", "wbs_nodes", "work_breakdown"):
-            if _looks_like_nodes(_coerce_list(obj.get(alt))):
-                obj["nodes"] = _coerce_list(obj.get(alt))
-                break
-        else:
-            for v in obj.values():
-                if _looks_like_nodes(_coerce_list(v)):
-                    obj["nodes"] = _coerce_list(v)
-                    break
-
-    obj["nodes"] = _coerce_list(obj.get("nodes"))
-    obj["milestones"] = _coerce_list(obj.get("milestones"))
-    return obj
+    # 里程碑（同樣容忍別名）
+    lower = {k.lower(): k for k in obj.keys()}
+    raw_ms = []
+    for mk in ("milestones", "milestone", "里程碑"):
+        if mk in lower:
+            raw_ms = _coerce_list(obj[lower[mk]])
+            break
+    milestones = []
+    for m in raw_ms:
+        if not isinstance(m, dict):
+            continue
+        milestones.append(
+            {
+                "id": str(_pick(m, "id") or f"m{len(milestones)+1}"),
+                "name": _pick(m, "title") or "",
+                "date": _pick(m, "due_date") or m.get("date"),
+                "deliverables": m.get("deliverables") if isinstance(m.get("deliverables"), list) else [],
+            }
+        )
+    return {"nodes": flat, "milestones": milestones}
 
 
 def parse_wbs_content(content: str) -> dict:
@@ -170,6 +299,93 @@ def _parse_date(value) -> date | None:
         return date.fromisoformat(str(value)[:10])
     except ValueError:
         return None
+
+
+def _convert_nodes_to_tw(nodes: list[WbsNode]) -> None:
+    """就地把節點的文字欄位轉成繁體（台灣用語）。owner_unit 也轉，方便對回單位清單。"""
+    for n in nodes:
+        n.title = to_tw(n.title)
+        n.description = to_tw(n.description)
+        n.deliverable = to_tw(n.deliverable)
+        n.owner_unit = to_tw(n.owner_unit)
+        n.workflow_stage = to_tw(n.workflow_stage)
+        if n.children:
+            _convert_nodes_to_tw(n.children)
+
+
+def _detect_unit_days(conditions: str) -> int | None:
+    """從條件偵測排程粒度，回傳每個工作項的『日曆天』跨度；無指定回 None。"""
+    c = conditions or ""
+    if any(k in c for k in ("雙週", "双周", "兩週", "两周", "二週", "sprint", "Sprint", "2週", "2周")):
+        return 14
+    if any(k in c for k in ("週", "周", "week", "Week", "WEEK", "每周", "每週")):
+        return 7
+    if any(k in c for k in ("日", "天", "每日", "day", "Day", "daily")):
+        return 1
+    if any(k in c for k in ("月", "每月", "month", "Month")):
+        return 30
+    return None
+
+
+def _iter_nodes(nodes: list[WbsNode]):
+    for n in nodes:
+        yield n
+        if n.children:
+            yield from _iter_nodes(n.children)
+
+
+def _has_missing_dates(nodes: list[WbsNode]) -> bool:
+    for n in _iter_nodes(nodes):
+        if not n.children and (n.start_date is None or n.due_date is None):
+            return True
+    return False
+
+
+def _apply_schedule(roots: list[WbsNode], today: date, delivery: date | None, unit_days: int) -> None:
+    """以指定粒度，把葉節點依序排成連續時段，再把父節點的起訖日由子節點上捲。
+    LLM 擅長拆解、不擅長日期算術，故排程在此以程式決定，確保符合『以週為單位』等要求。"""
+    # 工作天估時：週→5、雙週→10、其餘≈跨度
+    work_days = {7: 5, 14: 10, 1: 1, 30: 22}.get(unit_days, max(1, unit_days - 2))
+    # 週/雙週對齊到下一個週一
+    cursor = today
+    if unit_days in (7, 14):
+        cursor = today + timedelta(days=(0 - today.weekday()) % 7 or 0)
+
+    leaves = [n for n in _iter_nodes(roots) if not n.children]
+    span_end_offset = {7: 4, 14: 11}.get(unit_days, unit_days - 1)  # 週一→週五為 +4
+    for leaf in leaves:
+        start = cursor
+        due = start + timedelta(days=span_end_offset)
+        if delivery:  # 不超過交付日
+            if start > delivery:
+                start = delivery
+            if due > delivery:
+                due = delivery
+        leaf.start_date = start
+        leaf.due_date = due
+        leaf.estimate_days = float(work_days)
+        # 推進到下一個時段起點
+        cursor = start + timedelta(days=unit_days)
+
+    # 由葉往根上捲父節點起訖日
+    def rollup(node: WbsNode):
+        if not node.children:
+            return node.start_date, node.due_date
+        starts, dues = [], []
+        for ch in node.children:
+            s, d = rollup(ch)
+            if s:
+                starts.append(s)
+            if d:
+                dues.append(d)
+        if starts:
+            node.start_date = min(starts)
+        if dues:
+            node.due_date = max(dues)
+        return node.start_date, node.due_date
+
+    for r in roots:
+        rollup(r)
 
 
 def _build_tree(flat_nodes: list[dict]) -> list[WbsNode]:
@@ -247,7 +463,10 @@ def generate_wbs(req: GenerateWbsRequest, workflow: WorkflowTemplate | None) -> 
         f"# 交付物\n{chr(10).join('- ' + d for d in req.deliverables) if req.deliverables else '（請依需求自行歸納）'}\n\n"
         f"# 交付日（最後期限）\n{delivery}\n\n"
         f"# 相關條件 / 限制\n{req.conditions or '（無）'}\n\n"
-        f"請拆解成完整 WBS。所有日期必須介於 {today.isoformat()} 與交付日之間。只輸出 JSON。"
+        f"# 排程規則（務必嚴格遵守）\n{_schedule_directive(req.conditions, today.isoformat(), delivery)}\n\n"
+        f"請拆解成完整 WBS。所有日期必須介於 {today.isoformat()} 與交付日之間。\n"
+        f"務必使用欄位名：title（不要用 name）、due_date（不要用 end_date）、parent_id 表示階層、type 為 epic/story/task/subtask。\n"
+        "只輸出 JSON 物件，最外層鍵為 \"nodes\" 與 \"milestones\"。"
     )
 
     messages = [
@@ -271,19 +490,20 @@ def generate_wbs(req: GenerateWbsRequest, workflow: WorkflowTemplate | None) -> 
         content = completion.choices[0].message.content or ""
         return parse_wbs_content(content), content
 
-    # 本地模型偶爾回空/雜輸出，最多嘗試兩次
-    tool_input, last_content, attempts = {}, "", 0
+    # 本地模型偶爾回空/雜輸出，最多嘗試兩次；以「組樹後」的節點數判定成敗
+    tool_input, last_content, attempts, nodes = {}, "", 0, []
     for attempt in range(2):
         attempts = attempt + 1
         try:
             tool_input, last_content = _generate_once()
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"呼叫 LLM 失敗：{exc}") from exc
-        if tool_input.get("nodes"):
+        nodes = _build_tree(tool_input.get("nodes", []))
+        if nodes:
             break
-        logger.warning("WBS 產生第 %d 次沒有節點，原始輸出前 800 字：%s", attempts, last_content[:800])
+        logger.warning("WBS 產生第 %d 次組樹後沒有節點，原始輸出前 800 字：%s", attempts, last_content[:800])
 
-    success = bool(tool_input.get("nodes"))
+    success = bool(nodes)
     # 不論成功與否，存下請求與模型原始輸出，供回測（replay）
     gen_log.log_generation(
         model=settings.wbs_model,
@@ -307,13 +527,20 @@ def generate_wbs(req: GenerateWbsRequest, workflow: WorkflowTemplate | None) -> 
             "（在 .env 把 WBS_MODEL 改成 qwen2.5:14b）或縮短需求內容後重試。"
         )
 
-    nodes = _build_tree(tool_input.get("nodes", []))
+    # 排程以程式決定（LLM 不擅長日期算術）：指定了粒度，或葉節點缺起訖日時都套用。
+    unit_days = _detect_unit_days(req.conditions)
+    if unit_days or _has_missing_dates(nodes):
+        _apply_schedule(nodes, today, req.delivery_date, unit_days or 7)
+
+    # 內容統一為繁體中文（台灣用語）：本地模型常產出簡體，於此確定性轉換。
+    _convert_nodes_to_tw(nodes)
+
     milestones = [
         Milestone(
             id=str(m.get("id")),
-            name=m.get("name", ""),
+            name=to_tw(m.get("name", "")),
             date=_parse_date(m.get("date")),
-            deliverables=m.get("deliverables") or [],
+            deliverables=[to_tw(d) for d in (m.get("deliverables") or [])],
         )
         for m in tool_input.get("milestones", [])
     ]
