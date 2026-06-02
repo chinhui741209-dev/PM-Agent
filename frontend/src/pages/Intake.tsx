@@ -55,10 +55,11 @@ export default function Intake() {
     setElapsed(0);
     // 後端目前無進度回報；依經過時間推進階段標示，最後一階段停住等真正回應。
     const started = Date.now();
+    // 階段門檻依本地模型實測（單次約 1–3 分鐘）拉開，避免一下就跑到最後一格乾等。
     const timer = setInterval(() => {
       const sec = Math.floor((Date.now() - started) / 1000);
       setElapsed(sec);
-      setPhase(sec < 3 ? 0 : sec < 12 ? 1 : sec < 22 ? 2 : 3);
+      setPhase(sec < 8 ? 0 : sec < 40 ? 1 : sec < 90 ? 2 : 3);
     }, 500);
     try {
       let requirementText = text;
@@ -196,7 +197,7 @@ export default function Intake() {
               </li>
             ))}
           </ol>
-          <p className="muted">本地模型約需 10–30 秒，請勿關閉頁面。</p>
+          <p className="muted">本地模型視需求長度約需 1–3 分鐘，請勿關閉頁面。</p>
         </div>
       )}
 
