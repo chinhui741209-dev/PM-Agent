@@ -1,6 +1,6 @@
 # 02 軟體架構設計（ASPICE SWE.2 / ISO 26262-6 §7）
 
-> 最後更新：2026-06-01 ｜ 對應 git：9bdeecc ｜ 由 skill：record-architecture
+> 最後更新：2026-06-02 ｜ 對應 git：258e55f ｜ 由 skill：record-architecture
 
 ## 架構概觀
 PM-Agent 分為前端（React+Vite+TS）與後端（FastAPI）。後端以路由層（routers）接收請求，委派給服務層（services）處理輸入解析、LLM 產生 WBS、Jira 部署；資料模型（models）與驗證（validation）橫跨各層；草稿以 JSON 檔持久化。
@@ -14,8 +14,10 @@ graph TD
   ARC002 --> ARC005[ARC-005 Jira 整合]
   ARC002 --> ARC009[ARC-009 草稿儲存]
   ARC002 --> ARC010[ARC-010 模板資料]
+  ARC002 --> ARC012[ARC-012 Excel 匯出]
   ARC004 --> ARC007[ARC-007 資料模型]
   ARC004 --> ARC006[ARC-006 產生紀錄]
+  ARC004 --> ARC011[ARC-011 簡繁轉換]
   ARC004 -->|IF-007| LLM[(OpenAI/Ollama)]
   ARC002 --> ARC008[ARC-008 節點驗證]
   ARC005 --> Jira[(Jira Cloud)]
@@ -23,9 +25,10 @@ graph TD
 
 ## 元件清單
 ### ARC-001 前端
-- 職責：三頁流程 UI（輸入需求 → WBS 檢視/編輯/指派 → 部署 Jira）。
+- 職責：三頁流程 UI（輸入需求 → WBS 檢視/編輯/指派 → 部署 Jira）。Intake 顯示 WBS 產生分階段進度；WbsReview 支援結構編輯（新增/刪除/升降級/排序）與 Excel 下載。
 - 原始碼：`frontend/src/`（`pages/Intake.tsx`, `WbsReview.tsx`, `Deploy.tsx`, `api/client.ts`）
-- 對外介面：使用 IF-001~IF-006 ｜ 相依：ARC-002
+- 對外介面：使用 IF-001~IF-006, IF-008 ｜ 相依：ARC-002
+- 對應需求：SR-013
 
 ### ARC-002 後端 API / 路由
 - 職責：FastAPI app 與路由註冊、CORS、健康檢查。
@@ -39,10 +42,10 @@ graph TD
 - 提供介面：`parse_text`, `parse_upload` ｜ 對應需求：SR-001, SR-002
 
 ### ARC-004 WBS 產生服務
-- 職責：呼叫 LLM（JSON 模式）產 WBS，正規化雜格式、組樹、防呆、排程約束、產生紀錄。
+- 職責：呼叫 LLM（JSON 模式）產 WBS，正規化雜格式（欄位別名、巢狀 children 攤平）、組樹、防呆；依條件偵測粒度後以程式排程；內容轉繁中；產生紀錄。
 - 原始碼：`backend/app/services/wbs_generator.py`
-- 提供介面：`generate_wbs`, `parse_wbs_content` ｜ 使用 IF-007（LLM）
-- 對應需求：SR-003, SR-004, SR-005, SR-006
+- 提供介面：`generate_wbs`, `parse_wbs_content` ｜ 使用 IF-007（LLM）｜ 相依：ARC-011（簡繁轉換）
+- 對應需求：SR-003, SR-004, SR-005, SR-006, SR-010
 
 ### ARC-005 Jira 整合
 - 職責：Jira Cloud REST v3 封裝；建 issue 階層、Version、label、狀態 transition。
@@ -69,6 +72,16 @@ graph TD
 - 職責：預設工作流模板與組織單位清單。
 - 原始碼：`backend/app/templates_data.py`
 
+### ARC-011 簡繁轉換服務
+- 職責：以 OpenCC（s2twp）把字串轉為繁體中文（台灣用語）；套件缺失時退化為原樣回傳。
+- 原始碼：`backend/app/services/zh_convert.py` ｜ 提供介面：`to_tw`
+- 被使用：ARC-004（節點與里程碑文字轉換）｜ 對應需求：SR-011
+
+### ARC-012 Excel 匯出
+- 職責：以 openpyxl 把 WbsDraft 產生 .xlsx（工作項 + 里程碑兩工作表、表頭樣式、依類型著色）。
+- 原始碼：`backend/app/services/excel_export.py` ｜ 提供介面：`build_wbs_workbook`
+- 被使用：ARC-002（IF-008）｜ 對應需求：SR-012
+
 ## 介面清單
 | IF | 名稱 | 提供者 | 使用者 | 規格 | 資料 |
 |---|---|---|---|---|---|
@@ -79,3 +92,4 @@ graph TD
 | IF-005 | 部署 Jira | ARC-002 | ARC-001 | `POST /api/jira/deploy` | DF-005 |
 | IF-006 | 模板 | ARC-002 | ARC-001 | `GET /api/templates/*` | — |
 | IF-007 | LLM 呼叫 | OpenAI/Ollama | ARC-004 | `chat.completions`（JSON 模式） | DF-003 |
+| IF-008 | 匯出 Excel | ARC-002 | ARC-001 | `GET /api/wbs/{id}/export.xlsx` | DF-004→DF-007 |

@@ -1,6 +1,6 @@
 # 合規文件索引（PM-Agent）
 
-> 最後更新：2026-06-01 ｜ 對應 git：9bdeecc ｜ 由 skill：end-of-work
+> 最後更新：2026-06-02 ｜ 對應 git：258e55f ｜ 由 skill：end-of-work
 >
 > 本資料夾為符合 **ASPICE SWE.1–6** 與 **ISO 26262 Part 6（軟體層）** 的工作產出與雙向追溯證據，
 > 由 `~/.claude/skills/` 的合規記錄 skills 自動產生與維護。
