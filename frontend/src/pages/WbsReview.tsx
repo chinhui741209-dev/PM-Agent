@@ -98,6 +98,23 @@ export default function WbsReview() {
     }
   }
 
+  async function downloadExcel() {
+    if (!draft) return;
+    setError("");
+    try {
+      // 先存檔，確保下載到的是最新編輯內容
+      await api.saveWbs(draft);
+      const a = document.createElement("a");
+      a.href = `/api/wbs/${draft.id}/export.xlsx`;
+      a.download = `WBS-${draft.id}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   return (
     <div>
       <h1>WBS 檢視與編輯</h1>
@@ -197,6 +214,7 @@ export default function WbsReview() {
 
       <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
         <button onClick={save} disabled={saving}>{saving ? "儲存中…" : "💾 儲存 WBS"}</button>
+        <button className="secondary" onClick={downloadExcel}>⬇️ 下載 Excel</button>
         <button className="secondary" onClick={() => nav(`/deploy/${draft.id}`)}>前往部署 Jira →</button>
         {savedAt && <span className="muted">已於 {savedAt} 儲存</span>}
       </div>
