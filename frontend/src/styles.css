@@ -102,3 +102,17 @@ td input, td select, td textarea { padding: 4px 6px; font-size: 13px; }
 
 .spinner { color: var(--muted); }
 .deployed-ok { color: #166534; } .deployed-err { color: #991b1b; }
+
+/* WBS 結構編輯的列內操作按鈕 */
+.row-actions { display: flex; gap: 2px; }
+.row-actions button { padding: 2px 6px; font-size: 13px; line-height: 1.2; }
+.row-actions button:hover { background: #eef2ff; }
+.row-actions button.danger:hover { background: #fee2e2; }
+.row-actions button:disabled { opacity: 0.3; }
+
+/* WBS 產生中的分階段進度 */
+.progress-steps { list-style: none; padding: 0; margin: 8px 0; }
+.progress-steps li { display: flex; align-items: center; gap: 8px; padding: 6px 0; color: var(--muted); font-size: 14px; }
+.progress-steps li .mark { display: inline-flex; width: 18px; justify-content: center; }
+.progress-steps li.active { color: var(--primary); font-weight: 600; }
+.progress-steps li.done { color: var(--task); }

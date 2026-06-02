@@ -17,12 +17,99 @@ function flatten(nodes: WbsNode[], depth = 0): FlatRow[] {
   return out;
 }
 
+// 節點自身 + 所有子孫的數量（刪除確認用）
+function countSubtree(node: WbsNode): number {
+  return 1 + (node.children ?? []).reduce((sum, c) => sum + countSubtree(c), 0);
+}
+
 function updateNode(nodes: WbsNode[], id: string, patch: Partial<WbsNode>): WbsNode[] {
   return nodes.map((n) => {
     if (n.id === id) return { ...n, ...patch };
     if (n.children?.length) return { ...n, children: updateNode(n.children, id, patch) };
     return n;
   });
+}
+
+// ---- 結構編輯（新增 / 刪除 / 上下移 / 升降級）----
+// 後端 PUT /api/wbs/{id} 會整份覆寫，故結構調整只需在前端重組樹，存檔即生效。
+
+const TYPES: WbsNode["type"][] = ["epic", "story", "task", "subtask"];
+const typeForDepth = (d: number): WbsNode["type"] => TYPES[Math.min(d, TYPES.length - 1)];
+
+function newNode(depth: number): WbsNode {
+  return {
+    id: crypto.randomUUID(),
+    type: typeForDepth(depth),
+    title: "新工作項",
+    description: "",
+    deliverable: null,
+    owner_unit: null,
+    assignee_account_id: null,
+    estimate_days: null,
+    start_date: null,
+    due_date: null,
+    milestone_id: null,
+    workflow_stage: null,
+    dependencies: [],
+    children: [],
+  };
+}
+
+function addChild(nodes: WbsNode[], parentId: string, depth = 0): WbsNode[] {
+  return nodes.map((n) => {
+    if (n.id === parentId) return { ...n, children: [...(n.children ?? []), newNode(depth + 1)] };
+    if (n.children?.length) return { ...n, children: addChild(n.children, parentId, depth + 1) };
+    return n;
+  });
+}
+
+function removeNode(nodes: WbsNode[], id: string): WbsNode[] {
+  return nodes
+    .filter((n) => n.id !== id)
+    .map((n) => (n.children?.length ? { ...n, children: removeNode(n.children, id) } : n));
+}
+
+// 在同層的兄弟間上移(-1)/下移(+1)；到邊界則不動
+function moveNode(nodes: WbsNode[], id: string, dir: -1 | 1): WbsNode[] {
+  const idx = nodes.findIndex((n) => n.id === id);
+  if (idx !== -1) {
+    const j = idx + dir;
+    if (j < 0 || j >= nodes.length) return nodes;
+    const copy = [...nodes];
+    [copy[idx], copy[j]] = [copy[j], copy[idx]];
+    return copy;
+  }
+  return nodes.map((n) => (n.children?.length ? { ...n, children: moveNode(n.children, id, dir) } : n));
+}
+
+// 降級：成為前一個兄弟的子節點（最上面一個無前兄弟，無法降級）
+function indentNode(nodes: WbsNode[], id: string, depth = 0): WbsNode[] {
+  const idx = nodes.findIndex((n) => n.id === id);
+  if (idx > 0) {
+    const node = { ...nodes[idx], type: typeForDepth(depth + 1) };
+    const prev = nodes[idx - 1];
+    const copy = [...nodes];
+    copy[idx - 1] = { ...prev, children: [...(prev.children ?? []), node] };
+    copy.splice(idx, 1);
+    return copy;
+  }
+  return nodes.map((n) => (n.children?.length ? { ...n, children: indentNode(n.children, id, depth + 1) } : n));
+}
+
+// 升級：脫離父節點，成為父節點的下一個兄弟（頂層節點無父，無法升級）
+function outdentNode(nodes: WbsNode[], id: string, depth = 0): WbsNode[] {
+  const out: WbsNode[] = [];
+  for (const n of nodes) {
+    const childIdx = (n.children ?? []).findIndex((c) => c.id === id);
+    if (childIdx !== -1) {
+      const child = { ...n.children[childIdx], type: typeForDepth(depth) };
+      out.push({ ...n, children: n.children.filter((_, i) => i !== childIdx) });
+      out.push(child);
+    } else {
+      out.push(n.children?.length ? { ...n, children: outdentNode(n.children, id, depth + 1) } : n);
+    }
+  }
+  return out;
 }
 
 export default function WbsReview() {
@@ -83,6 +170,22 @@ export default function WbsReview() {
     setDraft((d) => (d ? { ...d, nodes: updateNode(d.nodes, nodeId, p) } : d));
   }
 
+  // 結構操作：改完只更新前端狀態，按「儲存」才寫回後端（與欄位編輯一致）
+  const mutate = (fn: (nodes: WbsNode[]) => WbsNode[]) =>
+    setDraft((d) => (d ? { ...d, nodes: fn(d.nodes) } : d));
+
+  function addChildRow(node: WbsNode) {
+    mutate((nodes) => addChild(nodes, node.id));
+  }
+  function addRoot() {
+    setDraft((d) => (d ? { ...d, nodes: [...d.nodes, newNode(0)] } : d));
+  }
+  function deleteRow(node: WbsNode) {
+    const n = node.children?.length ? countSubtree(node) : 1;
+    if (n > 1 && !window.confirm(`確定刪除「${node.title}」及其 ${n - 1} 個子項？`)) return;
+    mutate((nodes) => removeNode(nodes, node.id));
+  }
+
   async function save() {
     if (!draft) return;
     setSaving(true);
@@ -138,8 +241,11 @@ export default function WbsReview() {
       )}
 
       <div className="panel">
-        <h2>工作分解結構（{rows.length} 項）</h2>
-        <p className="muted">可直接編輯標題、負責單位、初始階段、日期與估時。</p>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+          <h2>工作分解結構（{rows.length} 項）</h2>
+          <button className="secondary" onClick={addRoot}>＋ 新增主項目</button>
+        </div>
+        <p className="muted">可直接編輯欄位；用最右側按鈕新增子項、調整層級或刪除。改完記得按「儲存」。</p>
         <table>
           <thead>
             <tr>
@@ -149,6 +255,7 @@ export default function WbsReview() {
               <th>開始</th>
               <th>到期</th>
               <th>估時(天)</th>
+              <th style={{ width: 1, whiteSpace: "nowrap" }}>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -203,6 +310,16 @@ export default function WbsReview() {
                     onChange={(e) => patch(node.id, { estimate_days: e.target.value ? Number(e.target.value) : null })}
                     style={{ width: 60 }}
                   />
+                </td>
+                <td>
+                  <div className="row-actions">
+                    <button className="ghost" title="新增子項" onClick={() => addChildRow(node)}>＋</button>
+                    <button className="ghost" title="上移" onClick={() => mutate((n) => moveNode(n, node.id, -1))}>↑</button>
+                    <button className="ghost" title="下移" onClick={() => mutate((n) => moveNode(n, node.id, 1))}>↓</button>
+                    <button className="ghost" title="升級（往左移一層）" disabled={depth === 0} onClick={() => mutate((n) => outdentNode(n, node.id))}>⬅</button>
+                    <button className="ghost" title="降級（成為前一項的子項）" onClick={() => mutate((n) => indentNode(n, node.id))}>➡</button>
+                    <button className="ghost danger" title="刪除" onClick={() => deleteRow(node)}>🗑</button>
+                  </div>
                 </td>
               </tr>
             ))}

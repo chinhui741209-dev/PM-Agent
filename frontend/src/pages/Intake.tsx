@@ -17,6 +17,8 @@ export default function Intake() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
+  const [phase, setPhase] = useState(-1);
+  const [elapsed, setElapsed] = useState(0);
 
   useEffect(() => {
     api.workflows().then((w) => {
@@ -49,6 +51,15 @@ export default function Intake() {
   async function generate() {
     setBusy(true);
     setError("");
+    setPhase(0);
+    setElapsed(0);
+    // 後端目前無進度回報；依經過時間推進階段標示，最後一階段停住等真正回應。
+    const started = Date.now();
+    const timer = setInterval(() => {
+      const sec = Math.floor((Date.now() - started) / 1000);
+      setElapsed(sec);
+      setPhase(sec < 3 ? 0 : sec < 12 ? 1 : sec < 22 ? 2 : 3);
+    }, 500);
     try {
       let requirementText = text;
       if (mode === "file" && file) {
@@ -70,9 +81,18 @@ export default function Intake() {
     } catch (e) {
       setError(String(e));
     } finally {
+      clearInterval(timer);
       setBusy(false);
+      setPhase(-1);
     }
   }
+
+  const PHASES = [
+    "解析需求內容",
+    "AI 拆解工作項（Epic / Story / Task）",
+    "計算排程與相依順序",
+    "整理為繁體中文並組成樹狀結構",
+  ];
 
   return (
     <div>
@@ -161,6 +181,24 @@ export default function Intake() {
       </div>
 
       {error && <div className="error">{error}</div>}
+
+      {busy && phase >= 0 && (
+        <div className="panel">
+          <h2 style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span>AI 產生 WBS 中…</span>
+            <span className="muted">已耗時 {elapsed}s</span>
+          </h2>
+          <ol className="progress-steps">
+            {PHASES.map((p, i) => (
+              <li key={i} className={i < phase ? "done" : i === phase ? "active" : ""}>
+                <span className="mark">{i < phase ? "✓" : i === phase ? "▶" : "○"}</span>
+                {p}
+              </li>
+            ))}
+          </ol>
+          <p className="muted">本地模型約需 10–30 秒，請勿關閉頁面。</p>
+        </div>
+      )}
 
       <button onClick={generate} disabled={busy}>
         {busy ? "AI 產生 WBS 中…" : "🚀 產生 WBS"}
